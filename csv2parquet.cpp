@@ -1,25 +1,22 @@
 #include <cstdint>
 #include <iostream>
 #include <vector>
-#include <tuple>
-#include <fstream>
 #include <map>
-#include <memory>
-#include <cstdlib>
-#include <pthread.h>
+#include <fstream>
 
 #include "CSVReader.hpp"
 #include <arrow/api.h>
 #include <arrow/ipc/api.h>
 #include <arrow/io/api.h>
 #include <arrow/dataset/api.h>
+#include <parquet/arrow/writer.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 
 using arrow::Int32Builder;
-using arrow::StringBuilder;
 using arrow::FloatBuilder;
 using arrow::DoubleBuilder;
+using arrow::StringBuilder;
 using arrow::BooleanBuilder;
 
 typedef std::tuple<std::string,std::shared_ptr<arrow::DataType>> data_type_tup_t;
@@ -27,7 +24,7 @@ typedef std::tuple<std::string,std::shared_ptr<arrow::DataType>> data_type_tup_t
 arrow::Status csvToColumnarTable(
   std::vector<std::vector<std::string>> csvData,
   std::vector<data_type_tup_t> dataTypeVec,
-  std::shared_ptr<arrow::Table>& table) {
+  std::shared_ptr<arrow::Table> &table) {
   
   arrow::MemoryPool *pool = arrow::default_memory_pool();
 
@@ -104,121 +101,6 @@ arrow::Status csvToColumnarTable(
   return arrow::Status::OK();
 }
 
-struct write_file_thread_args {
-  int file_num;
-  std::string filename;
-  std::shared_ptr<arrow::RecordBatch> recordBatch;
-};
-
-/*
- * Function to write to file with file_num
- */
-void *WriteFile(void *threadarg) {
-  struct write_file_thread_args *args;
-  args = (struct write_file_thread_args *) threadarg;
-
-  std::shared_ptr<arrow::Schema> schema = args->recordBatch->schema();
-  int num_field = schema->num_fields();
-
-  std::ofstream outcsv;
-  outcsv.open("csv/" + args->filename + std::to_string(args->file_num) + ".csv");
-  
-  // write headers and get data cols
-  std::vector<std::shared_ptr<arrow::Array>> cols_vec;
-  for (int i=0; i<num_field; i++) {
-    std::shared_ptr<arrow::Field> field = schema->field(i);
-    outcsv << field->name();
-    if (i != num_field-1) {
-      outcsv << ",";
-    }
-
-    if (field->type()->Equals(arrow::int32())) {
-      cols_vec.push_back(std::static_pointer_cast<arrow::Int32Array>(args->recordBatch->column(i)));
-    } else if (field->type()->Equals(arrow::float32())) {
-      cols_vec.push_back(std::static_pointer_cast<arrow::FloatArray>(args->recordBatch->column(i)));
-    } else if (field->type()->Equals(arrow::float64())) {
-      cols_vec.push_back(std::static_pointer_cast<arrow::DoubleArray>(args->recordBatch->column(i)));
-    } else if (field->type()->Equals(arrow::utf8())) {
-      cols_vec.push_back(std::static_pointer_cast<arrow::StringArray>(args->recordBatch->column(i)));
-    } else if (field->type()->Equals(arrow::boolean())) {
-      cols_vec.push_back(std::static_pointer_cast<arrow::BooleanArray>(args->recordBatch->column(i)));
-    }
-  }
-  outcsv << std::endl;
-
-  // prepare bool -> string map
-  std::map<bool, std::string> bool_str_map = {
-    {true, "true"}, {false, "false"}
-  };
-
-  int64_t num_row = args->recordBatch->num_rows(), num_col = args->recordBatch->num_columns();
-  for (int64_t i=0; i<num_row; i++) {
-    for (int64_t j=0; j<num_col; j++) {
-      std::shared_ptr<arrow::Array> col_arr = cols_vec.at(j);
-      std::shared_ptr<arrow::DataType> type = col_arr->type();
-      if (type->Equals(arrow::int32())) {
-        outcsv << dynamic_cast<arrow::Int32Array*>( &(*col_arr) )->Value(i);
-      } else if (type->Equals(arrow::float32())) {
-        outcsv << std::fixed << dynamic_cast<arrow::FloatArray*>( &(*col_arr) )->Value(i);
-      } else if (type->Equals(arrow::float64())) {
-        outcsv << std::fixed << dynamic_cast<arrow::DoubleArray*>( &(*col_arr) )->Value(i);
-      } else if (type->Equals(arrow::utf8())) {
-        outcsv << dynamic_cast<arrow::StringArray*>( &(*col_arr) )->GetString(i);
-      } else if (type->Equals(arrow::boolean())) {
-        outcsv << bool_str_map.find(dynamic_cast<arrow::BooleanArray*>( &(*col_arr) )->Value(i))->second;
-      }
-      if (j < num_col-1) {
-        outcsv << ",";
-      } else {
-        outcsv << std::endl;
-      }
-    }
-  }
-  outcsv.close();
-
-  pthread_exit(NULL);
-}
-
-arrow::Status columnarTableToCSV(const std::shared_ptr<arrow::Table> &table, std::string filename, uint factor) {
-  arrow::TableBatchReader tableBatchReader(*table);
-  int64_t table_row_num = table->num_rows();
-
-  if (factor > table_row_num) {
-    factor = table_row_num;
-  }
-  int64_t max_chunk_size = table_row_num / factor;
-  tableBatchReader.set_chunksize(max_chunk_size);
-
-  pthread_t thread_arr[factor];
-  write_file_thread_args td[factor];
-  int rc;
-  for (uint f_idx=0; f_idx<factor; f_idx++) {
-    td[f_idx].file_num = f_idx;
-    td[f_idx].filename = filename;
-    tableBatchReader.ReadNext(&td[f_idx].recordBatch);
-    rc = pthread_create(&thread_arr[f_idx], NULL, WriteFile, (void *)&td[f_idx]);
-
-    if (rc) {
-      std::cout << "Error:unable to create thread," << rc << std::endl;
-      exit(EXIT_FAILURE);
-    }
-  }
-
-  void *status;
-  for (uint f_idx=0; f_idx<factor; f_idx++) {
-    rc = pthread_join(thread_arr[f_idx], &status);
-    if (rc) {
-      std::cout << "Error:unable to join, " << rc << std::endl;
-      exit(EXIT_FAILURE);
-    }
-
-    std::cout << "Write: completed thread id :" << f_idx;
-    std::cout << " exiting with status :" << status << std::endl;  
-  }
-  
-  pthread_exit(NULL);
-  return arrow::Status::OK();  
-}
 
 void printOutTable(const std::shared_ptr<arrow::Table> &table) {
   int num_col = table->num_columns();
@@ -257,7 +139,6 @@ std::vector<data_type_tup_t> parseDataTypeString(std::string dataTypes, std::vec
   std::vector<std::string> vec;
   boost::algorithm::split(vec, dataTypes, boost::is_any_of(","));
 
-  std::cout << vec.size() << " " << header.size() << std::endl;
   assert(vec.size() == header.size());
   std::vector<data_type_tup_t> dataTypeVec;
   int headerLen = header.size();
@@ -280,6 +161,72 @@ std::vector<data_type_tup_t> parseDataTypeString(std::string dataTypes, std::vec
   return dataTypeVec;
 }
 
+struct write_file_thread_args {
+  int file_num;
+  std::string filename;
+  std::shared_ptr<arrow::Table> table;
+};
+
+void *WriteFile(void *threadarg) {
+  struct write_file_thread_args *args;
+  args = (struct write_file_thread_args *) threadarg;
+
+  std::shared_ptr<arrow::io::FileOutputStream> outfile;
+  arrow::io::FileOutputStream::Open("parquet/" + args->filename + std::to_string(args->file_num) + ".parquet", &outfile);
+  parquet::arrow::WriteTable(*(args->table), arrow::default_memory_pool(), outfile, args->table->num_rows());
+
+  outfile->Close();
+
+  pthread_exit(NULL);
+}
+
+arrow::Status exportArrowToParquet(const std::shared_ptr<arrow::Table>& table, std::string filename, int factor) {
+  arrow::TableBatchReader tableBatchReader(*table);
+  int64_t table_row_num = table->num_rows();
+
+  if (factor > table_row_num) {
+    factor = table_row_num;
+  }
+  int64_t max_chunk_size = table_row_num / factor;
+  tableBatchReader.set_chunksize(max_chunk_size);
+
+  pthread_t thread_arr[factor];
+  write_file_thread_args td[factor];
+  std::vector<std::shared_ptr<arrow::RecordBatch>> temp_recordbatch = {
+    std::shared_ptr<arrow::RecordBatch>()
+  };
+  int rc;
+  for (uint f_idx=0; f_idx<factor; f_idx++) {
+    td[f_idx].file_num = f_idx;
+    td[f_idx].filename = filename;
+    
+    tableBatchReader.ReadNext(&temp_recordbatch.at(0));
+    arrow::Table::FromRecordBatches(temp_recordbatch, &td[f_idx].table);
+
+    rc = pthread_create(&thread_arr[f_idx], NULL, WriteFile, (void *)&td[f_idx]);
+
+    if (rc) {
+      std::cout << "Error:unable to create thread," << rc << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  void *status;
+  for (uint f_idx=0; f_idx<factor; f_idx++) {
+    rc = pthread_join(thread_arr[f_idx], &status);
+    if (rc) {
+      std::cout << "Error:unable to join, " << rc << std::endl;
+      exit(EXIT_FAILURE);
+    }
+
+    std::cout << "Write: completed thread id :" << f_idx;
+    std::cout << " exiting with status :" << status << std::endl;  
+  }
+  
+  pthread_exit(NULL);
+  return arrow::Status::OK();  
+}
+
 int main(int argc, char **argv) {
   // validating usage
   if (argc < 5) {
@@ -299,11 +246,9 @@ int main(int argc, char **argv) {
   csvToColumnarTable(csvData, dataTypeVec, table);
 
   // write out data
-  assert(table->num_columns() == csvHeader.size());
   printOutTable(table);
 
-  // export to csv
-  columnarTableToCSV(table, fout, boost::lexical_cast<int>(factor));
-
+  // export to parquet
+  exportArrowToParquet(table, fout, boost::lexical_cast<int>(factor));
   return EXIT_SUCCESS;
 }
